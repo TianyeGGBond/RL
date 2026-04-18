@@ -55,9 +55,13 @@ import torch
 #
 # - ``"manual"``: walk ``parallel_state`` globals, call
 #   ``torch.distributed.destroy_process_group`` on every NCCL ProcessGroup,
-#   then null the globals ourselves. Gives us full control over the
-#   destruction order and (critically for partial-overlap) guarantees every
-#   NCCL communicator buffer is released.
+#   null the group attributes ourselves, and then delegate the residual
+#   non-group state reset (``_GLOBAL_MEMORY_BUFFER``, ``_MPU_*``, virtual
+#   pipeline trackers, etc.) to ``parallel_state.destroy_model_parallel()``
+#   so we stay forward-compatible with Megatron versions. The manual path's
+#   unique contribution versus ``"official"`` is the per-group
+#   ``destroy_process_group`` call, which is what actually releases the
+#   NCCL communicator buffers synchronously — essential for partial-overlap.
 #
 # - ``"official"``: delegate to ``parallel_state.destroy_model_parallel()``
 #   and rely on Megatron's own cleanup. This is the fallback required by
@@ -192,7 +196,20 @@ def _destroy_manual(*, verbose: bool) -> int:
     Returns the number of groups successfully destroyed. Per-group failures
     are tolerated (they are logged in verbose mode and counted only as
     failures); reload will rebuild everything from scratch regardless.
+
+    After the per-group destruction loop, we also invoke
+    ``parallel_state.destroy_model_parallel()`` to reset the non-group
+    module-level state that Megatron tracks (e.g. ``_GLOBAL_MEMORY_BUFFER``,
+    ``_MPU_*_WORLD_SIZE``, ``_VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK``). That
+    residual state cannot be nulled by our group-attribute walker because
+    those globals do not follow the ``_*_GROUP*`` naming convention, and
+    leaving them set causes the next ``initialize_model_parallel`` to
+    raise ``AssertionError: global memory buffer is already initialized``.
+    Delegating to Megatron's own reset keeps us automatically in sync with
+    whatever state Megatron adds across versions.
     """
+    from megatron.core import parallel_state
+
     groups = _collect_all_nccl_groups()
     destroyed = 0
     for name, pg in groups:
@@ -209,6 +226,25 @@ def _destroy_manual(*, verbose: bool) -> int:
                 )
 
     _reset_parallel_state_globals()
+
+    # Hand residual (non-group) module-state cleanup to Megatron's own
+    # reset. This is the authoritative list of globals to null and keeps
+    # us forward-compatible with Megatron versions that add new ones.
+    if hasattr(parallel_state, "destroy_model_parallel"):
+        try:
+            parallel_state.destroy_model_parallel()
+            if verbose:
+                print(
+                    "[nccl_offload] manual: delegated residual state reset "
+                    "to parallel_state.destroy_model_parallel()"
+                )
+        except Exception as exc:  # noqa: BLE001 - surface diagnostics, don't crash
+            if verbose:
+                print(
+                    "[nccl_offload] manual: residual reset via "
+                    "destroy_model_parallel() raised "
+                    f"{type(exc).__name__}: {exc}"
+                )
     return destroyed
 
 
