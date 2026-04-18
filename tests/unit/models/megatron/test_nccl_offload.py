@@ -659,4 +659,108 @@ class TestDestroyOfficialMode:
         assert stats["mode"] == "manual"
         # Manual path was used — PGs were destroyed individually.
         assert len(fake_mcore["destroyed"]) > 0
-        fake_mcore["parallel_state"].destroy_model_parallel.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+#  Manual mode residual-state reset contract
+# --------------------------------------------------------------------------- #
+
+
+class TestManualModeResidualReset:
+    """Manual mode must delegate non-group state reset to Megatron.
+
+    The manual path explicitly destroys NCCL ProcessGroups (its unique
+    value-add over official mode) and nulls the group-shaped parallel_state
+    globals. But Megatron also tracks *non-group* module state
+    (``_GLOBAL_MEMORY_BUFFER``, ``_MPU_*_WORLD_SIZE``,
+    ``_VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK``, etc.) that does not match
+    the ``_*_GROUP*`` naming convention. Leaving those set causes the next
+    ``initialize_model_parallel`` to raise. To stay forward-compatible
+    with Megatron versions that add new non-group globals, the manual
+    path delegates that residual state reset to
+    ``parallel_state.destroy_model_parallel()``. These tests lock that
+    contract so regressions are caught without needing a GPU.
+    """
+
+    def test_manual_mode_invokes_destroy_model_parallel_for_residual_reset(
+        self, fake_mcore
+    ):
+        from nemo_rl.models.megatron.nccl_offload import destroy_megatron_nccl_groups
+
+        destroy_megatron_nccl_groups(mode="manual")
+
+        fake_mcore["parallel_state"].destroy_model_parallel.assert_called_once_with()
+
+    def test_manual_mode_destroys_groups_before_residual_reset(self, fake_mcore):
+        """Per-group destroy must run *before* the residual reset.
+
+        If we call destroy_model_parallel first, it nulls the group refs
+        and we would lose our chance to invoke destroy_process_group on
+        the underlying NCCL communicators.
+        """
+        from nemo_rl.models.megatron.nccl_offload import destroy_megatron_nccl_groups
+
+        events: list[str] = []
+
+        import torch
+
+        original_destroy_pg = torch.distributed.destroy_process_group
+
+        def tracking_destroy(pg):
+            events.append(f"destroy_process_group:{pg.name}")
+            original_destroy_pg(pg)
+
+        torch.distributed.destroy_process_group = tracking_destroy
+
+        fake_mcore["parallel_state"].destroy_model_parallel.side_effect = (
+            lambda: events.append("destroy_model_parallel")
+        )
+
+        try:
+            destroy_megatron_nccl_groups(mode="manual")
+        finally:
+            torch.distributed.destroy_process_group = original_destroy_pg
+
+        per_group_events = [e for e in events if e.startswith("destroy_process_group:")]
+        assert per_group_events, "expected at least one destroy_process_group call"
+        assert "destroy_model_parallel" in events
+        last_per_group_idx = max(
+            events.index(e) for e in per_group_events
+        )
+        dmp_idx = events.index("destroy_model_parallel")
+        assert last_per_group_idx < dmp_idx, (
+            "destroy_model_parallel must run AFTER the last per-group destroy; "
+            f"events were: {events}"
+        )
+
+    def test_manual_mode_tolerates_destroy_model_parallel_raising(self, fake_mcore):
+        """A raising residual-reset must not mask the successful per-group destroys.
+
+        If Megatron changes destroy_model_parallel semantics in a future
+        version, we want to keep working: the destroy call still returns
+        a usable stats dict and the per-group destroys already succeeded.
+        """
+        from nemo_rl.models.megatron.nccl_offload import destroy_megatron_nccl_groups
+
+        fake_mcore["parallel_state"].destroy_model_parallel.side_effect = RuntimeError(
+            "simulated residual-reset failure"
+        )
+
+        # Must not raise.
+        stats = destroy_megatron_nccl_groups(mode="manual")
+
+        assert stats["mode"] == "manual"
+        # Per-group destroys still happened — NCCL communicators are freed.
+        assert len(fake_mcore["destroyed"]) > 0
+
+    def test_manual_mode_skips_residual_reset_when_api_missing(self, fake_mcore):
+        """If parallel_state has no destroy_model_parallel at all, the
+        manual path must still complete (it just can't delegate)."""
+        from nemo_rl.models.megatron.nccl_offload import destroy_megatron_nccl_groups
+
+        del fake_mcore["parallel_state"].destroy_model_parallel
+
+        stats = destroy_megatron_nccl_groups(mode="manual")
+
+        assert stats["mode"] == "manual"
+        assert len(fake_mcore["destroyed"]) > 0

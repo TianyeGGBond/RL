@@ -33,9 +33,9 @@ skip). The worker script that actually runs under torchrun is
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -87,6 +87,72 @@ _REQUIRES_MEGATRON = pytest.mark.skipif(
 )
 
 
+def _resolve_torchrun() -> str:
+    """Find a ``torchrun`` whose Python actually has ``megatron.core``.
+
+    NeMo-RL installs Megatron into a per-worker uv venv (e.g.
+    ``/opt/ray_venvs/...MegatronPolicyWorker/``) separate from the default
+    interpreter. A plain ``shutil.which("torchrun")`` will typically return
+    the main-venv torchrun, whose Python does not have ``megatron.core``
+    and which therefore fails the worker import immediately.
+
+    Resolution order:
+      1. ``NCCL_OFFLOAD_TORCHRUN`` env var (explicit override).
+      2. ``NCCL_OFFLOAD_MCORE_VENV`` env var pointing at a venv root
+         (append ``bin/torchrun``).
+      3. Autodiscover any ``/opt/ray_venvs/*MegatronPolicyWorker*/bin/torchrun``.
+      4. Fall back to whatever ``shutil.which("torchrun")`` returns.
+    """
+    override = os.environ.get("NCCL_OFFLOAD_TORCHRUN")
+    if override and Path(override).exists():
+        return override
+
+    venv_root = os.environ.get("NCCL_OFFLOAD_MCORE_VENV")
+    if venv_root:
+        candidate = Path(venv_root) / "bin" / "torchrun"
+        if candidate.exists():
+            return str(candidate)
+
+    ray_venvs = Path("/opt/ray_venvs")
+    if ray_venvs.is_dir():
+        for entry in sorted(ray_venvs.iterdir()):
+            if "MegatronPolicyWorker" in entry.name:
+                candidate = entry / "bin" / "torchrun"
+                if candidate.exists():
+                    return str(candidate)
+
+    fallback = shutil.which("torchrun")
+    if fallback is None:
+        # _REQUIRES_TORCHRUN should have skipped us; defensive raise for
+        # callers that invoke _resolve_torchrun directly.
+        raise RuntimeError("torchrun not found on PATH")
+    return fallback
+
+
+def _format_worker_failure(report_path: Path) -> str:
+    """Read the worker's rank-0 JSON report and format any failure nicely.
+
+    Returns a human-readable string. Returns an empty string if no report
+    was written (worker died before writing) or the report has no failure.
+    """
+    if not report_path.exists():
+        return ""
+    try:
+        report = json.loads(report_path.read_text())
+    except Exception as exc:  # noqa: BLE001 - malformed report is diagnostic too
+        return f"(worker wrote report but it was not valid JSON: {exc})"
+
+    failure = report.get("failure")
+    if failure is None:
+        return ""
+
+    return (
+        f"Worker failure: {failure.get('type', '<unknown>')}: "
+        f"{failure.get('message', '')}\n"
+        f"Worker traceback:\n{failure.get('traceback', '<none>')}"
+    )
+
+
 def _run_worker(
     *,
     tp: int,
@@ -96,9 +162,10 @@ def _run_worker(
 ) -> dict[str, Any]:
     """Launch the worker via torchrun and return its rank-0 JSON report.
 
-    Raises the subprocess CalledProcessError (with stdout/stderr attached
-    to the message) on non-zero exit so the surrounding test fails with
-    useful diagnostics.
+    On non-zero exit, surfaces the worker's ``failure.traceback`` (written
+    to the JSON report by ``_nccl_offload_gpu_worker.py``) into the
+    assertion message so the cause is visible in pytest output instead of
+    being hidden behind torchrun's generic ``ChildFailedError``.
     """
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False
@@ -107,7 +174,7 @@ def _run_worker(
 
     try:
         cmd = [
-            "torchrun",
+            _resolve_torchrun(),
             f"--nproc_per_node={tp}",
             # Force a single-node rendezvous on loopback; --standalone is
             # the simplest way to avoid needing a master addr/port when
@@ -133,9 +200,11 @@ def _run_worker(
         )
 
         if proc.returncode != 0:
+            worker_failure = _format_worker_failure(report_path)
             raise AssertionError(
                 f"torchrun worker failed (mode={mode}, tp={tp}, cycles={cycles}).\n"
                 f"Exit code: {proc.returncode}\n"
+                f"{worker_failure}\n"
                 f"stdout:\n{proc.stdout}\n"
                 f"stderr:\n{proc.stderr}"
             )
