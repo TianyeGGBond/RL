@@ -45,9 +45,31 @@ broader context.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import torch
+
+
+# Offload mode selects which teardown path ``destroy_megatron_nccl_groups``
+# uses.
+#
+# - ``"manual"``: walk ``parallel_state`` globals, call
+#   ``torch.distributed.destroy_process_group`` on every NCCL ProcessGroup,
+#   then null the globals ourselves. Gives us full control over the
+#   destruction order and (critically for partial-overlap) guarantees every
+#   NCCL communicator buffer is released.
+#
+# - ``"official"``: delegate to ``parallel_state.destroy_model_parallel()``
+#   and rely on Megatron's own cleanup. This is the fallback required by
+#   Feature 11 / Gate 2.5: if the manual path exposes problems (stale
+#   handles, VRAM not returned, instability across cycles), operators can
+#   switch to this mode to retry.
+#
+# The two modes are expected to be functionally equivalent for a healthy
+# Megatron install; they only differ in who drives the teardown.
+NcclOffloadMode = Literal["manual", "official"]
+
+_DEFAULT_MODE: NcclOffloadMode = "manual"
 
 
 # --------------------------------------------------------------------------- #
@@ -57,6 +79,7 @@ import torch
 
 def destroy_megatron_nccl_groups(
     *,
+    mode: NcclOffloadMode = _DEFAULT_MODE,
     verbose: bool = False,
 ) -> dict[str, Any]:
     """Destroy every NCCL process group tracked by ``megatron.core.parallel_state``.
@@ -65,6 +88,20 @@ def destroy_megatron_nccl_groups(
     an empty snapshot). Idempotent: a second call is a no-op.
 
     Args:
+        mode: Which teardown strategy to use.
+
+            - ``"manual"`` (default): collect every ``ProcessGroup`` held by
+              ``parallel_state`` globals, call
+              ``torch.distributed.destroy_process_group`` on each, then null
+              the globals.
+            - ``"official"``: delegate teardown to
+              ``parallel_state.destroy_model_parallel()``. This is the
+              Gate 2.5 fallback required by Feature 11: if the manual path
+              fails (VRAM not released, stale handles, instability across
+              destroy/reload cycles), switch to this mode and retry Gate 2.5.
+              Reload is always performed by
+              ``parallel_state.initialize_model_parallel`` regardless of
+              ``mode``.
         verbose: If True, print per-group destroy/skip diagnostics.
 
     Returns:
@@ -74,6 +111,8 @@ def destroy_megatron_nccl_groups(
           initialized at call time.
         - ``num_groups_destroyed`` (int): Number of distinct process groups
           for which ``torch.distributed.destroy_process_group`` was called.
+          For ``mode="official"`` this is reported as ``-1`` because the
+          official API does not expose a count.
         - ``vram_freed_bytes`` (int): Difference in
           ``torch.cuda.memory_allocated()`` across this call. Note: freed
           memory may remain in the PyTorch caching allocator even after
@@ -82,7 +121,16 @@ def destroy_megatron_nccl_groups(
         - ``state_snapshot`` (dict): Parallel-config snapshot to be passed
           back to :func:`reload_megatron_nccl_groups`. Empty if Megatron
           parallel state was not initialized.
+        - ``mode`` (str): The mode that was actually used.
+
+    Raises:
+        ValueError: If ``mode`` is not one of ``"manual"`` / ``"official"``.
     """
+    if mode not in ("manual", "official"):
+        raise ValueError(
+            f"Invalid mode {mode!r}; must be 'manual' or 'official'."
+        )
+
     # Lazy import so the module is importable without Megatron installed
     # (e.g. in pure-Python unit tests that mock parallel_state).
     from megatron.core import parallel_state
@@ -92,6 +140,7 @@ def destroy_megatron_nccl_groups(
         "num_groups_destroyed": 0,
         "vram_freed_bytes": 0,
         "state_snapshot": {},
+        "mode": mode,
     }
 
     if not parallel_state.model_parallel_is_initialized():
@@ -100,10 +149,50 @@ def destroy_megatron_nccl_groups(
         return stats
 
     stats["initialized_before"] = True
+    # Snapshot must be captured *before* destruction — accessors may start
+    # raising once globals are nulled.
     stats["state_snapshot"] = _capture_parallel_state_snapshot()
 
     vram_before = _get_vram_allocated()
 
+    if mode == "manual":
+        destroyed = _destroy_manual(verbose=verbose)
+        stats["num_groups_destroyed"] = destroyed
+    else:
+        _destroy_official(verbose=verbose)
+        # The official path does not expose a destroy count; use -1 as a
+        # sentinel so callers can distinguish "no-op" (0) from "official
+        # path was used" (-1).
+        stats["num_groups_destroyed"] = -1
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    vram_after = _get_vram_allocated()
+    stats["vram_freed_bytes"] = max(0, vram_before - vram_after)
+
+    if verbose:
+        destroyed_str = (
+            str(stats["num_groups_destroyed"])
+            if stats["num_groups_destroyed"] >= 0
+            else "(official: unknown)"
+        )
+        print(
+            f"[nccl_offload] mode={mode} destroyed={destroyed_str}, "
+            f"freed ~{stats['vram_freed_bytes'] / (1024**2):.1f} MiB"
+        )
+
+    return stats
+
+
+def _destroy_manual(*, verbose: bool) -> int:
+    """Walk ``parallel_state`` and call ``destroy_process_group`` on each.
+
+    Returns the number of groups successfully destroyed. Per-group failures
+    are tolerated (they are logged in verbose mode and counted only as
+    failures); reload will rebuild everything from scratch regardless.
+    """
     groups = _collect_all_nccl_groups()
     destroyed = 0
     for name, pg in groups:
@@ -113,32 +202,51 @@ def destroy_megatron_nccl_groups(
             if verbose:
                 print(f"[nccl_offload] destroyed NCCL group from {name}")
         except Exception as exc:  # noqa: BLE001 - best-effort, keep going
-            # Individual destroy failures should not abort the whole pass;
-            # Megatron's own cleanup does the same. The reload step will
-            # re-create everything from scratch regardless.
             if verbose:
                 print(
-                    f"[nccl_offload] destroy failed for {name}: {type(exc).__name__}: {exc}"
+                    f"[nccl_offload] destroy failed for {name}: "
+                    f"{type(exc).__name__}: {exc}"
                 )
 
     _reset_parallel_state_globals()
+    return destroyed
 
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
 
-    vram_after = _get_vram_allocated()
+def _destroy_official(*, verbose: bool) -> None:
+    """Delegate teardown to Megatron's ``parallel_state.destroy_model_parallel``.
 
-    stats["num_groups_destroyed"] = destroyed
-    stats["vram_freed_bytes"] = max(0, vram_before - vram_after)
+    This is the Gate 2.5 fallback. We do not touch ``parallel_state``
+    globals ourselves here — the official API owns both the destroy and
+    the reset.
+    """
+    from megatron.core import parallel_state
 
-    if verbose:
-        print(
-            f"[nccl_offload] destroyed {destroyed} NCCL groups, "
-            f"freed ~{stats['vram_freed_bytes'] / (1024**2):.1f} MiB"
-        )
+    if not hasattr(parallel_state, "destroy_model_parallel"):
+        # Extremely old Megatron versions might not expose this symbol.
+        # In that case there is nothing we can meaningfully do; fall back
+        # to the manual path rather than silently succeeding.
+        if verbose:
+            print(
+                "[nccl_offload] official mode requested but "
+                "parallel_state.destroy_model_parallel is missing; "
+                "falling back to manual destroy."
+            )
+        _destroy_manual(verbose=verbose)
+        return
 
-    return stats
+    try:
+        parallel_state.destroy_model_parallel()
+        if verbose:
+            print("[nccl_offload] official destroy_model_parallel() returned")
+    except Exception as exc:  # noqa: BLE001 - surface diagnostics, don't crash
+        if verbose:
+            print(
+                "[nccl_offload] official destroy_model_parallel() raised "
+                f"{type(exc).__name__}: {exc}"
+            )
+        # If the official API raised, try to clean up any state it left
+        # behind so the subsequent reload has a clean slate.
+        _reset_parallel_state_globals()
 
 
 def reload_megatron_nccl_groups(

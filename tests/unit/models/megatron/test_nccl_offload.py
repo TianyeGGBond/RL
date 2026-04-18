@@ -145,6 +145,26 @@ def fake_mcore(monkeypatch):
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "barrier", MagicMock())
 
+    # The fake ``destroy_model_parallel`` simulates what the real Megatron
+    # API is expected to do: drop the NCCL globals so
+    # ``model_parallel_is_initialized`` returns False and a subsequent
+    # ``initialize_model_parallel`` can run. Individual group destruction
+    # is not simulated because the official API does not expose that
+    # granularity (we only observe its effect on ``destroyed`` when
+    # ``mode="manual"``).
+    def fake_destroy_model_parallel():
+        fake_state._TENSOR_MODEL_PARALLEL_GROUP = None
+        fake_state._PIPELINE_MODEL_PARALLEL_GROUP = None
+        fake_state._DATA_PARALLEL_GROUP = None
+        fake_state._DATA_PARALLEL_GROUP_WITH_CP = None
+        fake_state._DATA_PARALLEL_GROUP_GLOO = None
+        fake_state._CONTEXT_PARALLEL_GROUP = None
+        fake_state._EXPERT_MODEL_PARALLEL_GROUP = None
+        fake_state._HYBRID_DP_CP_GROUPS = []
+        fake_state.model_parallel_is_initialized.return_value = False
+
+    fake_state.destroy_model_parallel = MagicMock(side_effect=fake_destroy_model_parallel)
+
     return {
         "parallel_state": fake_state,
         "destroyed": destroyed,
@@ -417,12 +437,14 @@ class TestDestroyMegatronNcclGroups:
             "num_groups_destroyed",
             "vram_freed_bytes",
             "state_snapshot",
+            "mode",
         }
         assert isinstance(stats["initialized_before"], bool)
         assert isinstance(stats["num_groups_destroyed"], int)
         assert isinstance(stats["vram_freed_bytes"], int)
         assert stats["vram_freed_bytes"] >= 0
         assert isinstance(stats["state_snapshot"], dict)
+        assert stats["mode"] in ("manual", "official")
 
     def test_parallel_state_globals_cleared(self, fake_mcore):
         from nemo_rl.models.megatron.nccl_offload import destroy_megatron_nccl_groups
@@ -542,3 +564,99 @@ class TestReloadMegatronNcclGroups:
         assert kwargs["pipeline_model_parallel_size"] == 2
         assert kwargs["context_parallel_size"] == 2
         assert kwargs["expert_model_parallel_size"] == 2
+
+
+# --------------------------------------------------------------------------- #
+#  destroy with mode="official" (Gate 2.5 fallback path)
+# --------------------------------------------------------------------------- #
+
+
+class TestDestroyOfficialMode:
+    def test_official_mode_delegates_to_destroy_model_parallel(self, fake_mcore):
+        from nemo_rl.models.megatron.nccl_offload import destroy_megatron_nccl_groups
+
+        stats = destroy_megatron_nccl_groups(mode="official")
+
+        fake_mcore["parallel_state"].destroy_model_parallel.assert_called_once_with()
+        # Official path does not use our manual destroy, so the fake
+        # destroy_process_group counter stays empty.
+        assert fake_mcore["destroyed"] == []
+        # Sentinel: official path returns -1 for destroyed count.
+        assert stats["num_groups_destroyed"] == -1
+        assert stats["mode"] == "official"
+
+    def test_official_mode_still_captures_snapshot(self, fake_mcore):
+        from nemo_rl.models.megatron.nccl_offload import destroy_megatron_nccl_groups
+
+        stats = destroy_megatron_nccl_groups(mode="official")
+
+        assert stats["state_snapshot"]["tensor_model_parallel_size"] == 2
+        assert stats["state_snapshot"]["pipeline_model_parallel_size"] == 1
+
+    def test_official_mode_noop_when_not_initialized(self, fake_mcore):
+        from nemo_rl.models.megatron.nccl_offload import destroy_megatron_nccl_groups
+
+        fake_mcore["parallel_state"].model_parallel_is_initialized.return_value = False
+
+        stats = destroy_megatron_nccl_groups(mode="official")
+
+        fake_mcore["parallel_state"].destroy_model_parallel.assert_not_called()
+        assert stats["initialized_before"] is False
+        assert stats["num_groups_destroyed"] == 0  # Not -1: we never reached destroy
+        assert stats["mode"] == "official"
+
+    def test_official_mode_falls_back_to_manual_when_api_missing(
+        self, fake_mcore
+    ):
+        """If Megatron somehow doesn't expose destroy_model_parallel, we
+        quietly fall through to the manual path rather than no-oping."""
+        from nemo_rl.models.megatron.nccl_offload import destroy_megatron_nccl_groups
+
+        del fake_mcore["parallel_state"].destroy_model_parallel
+
+        stats = destroy_megatron_nccl_groups(mode="official")
+
+        # Manual destroy executed instead — we see PGs destroyed
+        assert len(fake_mcore["destroyed"]) > 0
+
+    def test_official_mode_tolerates_api_raising(self, fake_mcore):
+        from nemo_rl.models.megatron.nccl_offload import destroy_megatron_nccl_groups
+
+        fake_mcore["parallel_state"].destroy_model_parallel.side_effect = RuntimeError(
+            "simulated"
+        )
+
+        # Must not raise
+        stats = destroy_megatron_nccl_groups(mode="official")
+
+        assert stats["mode"] == "official"
+        # We still defensively reset globals even when the API raised.
+        assert fake_mcore["parallel_state"]._TENSOR_MODEL_PARALLEL_GROUP is None
+
+    def test_reload_after_official_destroy_works(self, fake_mcore):
+        """End-to-end contract: official destroy + reload is a valid cycle."""
+        from nemo_rl.models.megatron.nccl_offload import (
+            destroy_megatron_nccl_groups,
+            reload_megatron_nccl_groups,
+        )
+
+        stats = destroy_megatron_nccl_groups(mode="official")
+        reload_megatron_nccl_groups(stats["state_snapshot"])
+
+        fake_mcore["parallel_state"].initialize_model_parallel.assert_called_once()
+
+    def test_invalid_mode_raises(self, fake_mcore):
+        from nemo_rl.models.megatron.nccl_offload import destroy_megatron_nccl_groups
+
+        with pytest.raises(ValueError, match="Invalid mode"):
+            destroy_megatron_nccl_groups(mode="hybrid")  # type: ignore[arg-type]
+
+    def test_default_mode_is_manual(self, fake_mcore):
+        from nemo_rl.models.megatron.nccl_offload import destroy_megatron_nccl_groups
+
+        stats = destroy_megatron_nccl_groups()
+
+        assert stats["mode"] == "manual"
+        # Manual path was used — PGs were destroyed individually.
+        assert len(fake_mcore["destroyed"]) > 0
+        fake_mcore["parallel_state"].destroy_model_parallel.assert_not_called()
