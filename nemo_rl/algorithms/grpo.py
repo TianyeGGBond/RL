@@ -2376,6 +2376,7 @@ def async_grpo_train(
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
     max_trajectory_age_steps: int = 1,
+    rlix_hooks: Optional[Any] = None,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
 
@@ -2411,6 +2412,12 @@ def async_grpo_train(
                 "⚠️ WARNING: In-flight weight updates must be enabled for async GRPO with max_trajectory_age_steps > 1. "
                 "Without in-flight weight updates, having more max_trajectory_age_steps will not give any performance benefit."
             )
+
+    # RLix integration: import hooks and resolve defaults.
+    from nemo_rl.algorithms.rlix_hooks import DO_TIME_SHARING, NoOpRLixHooks
+
+    if rlix_hooks is None:
+        rlix_hooks = NoOpRLixHooks()
 
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
@@ -2535,6 +2542,10 @@ def async_grpo_train(
         start_step=step,
     )
 
+    # Register collector with RLix pipeline actor so _expand_workers can call
+    # set_weight_version after each selective sync (no-op in standalone mode).
+    rlix_hooks.on_trajectory_collector_created(trajectory_collector)
+
     # Start trajectory collection in background
     collection_task = trajectory_collector.start_collection.remote(dataloader)
 
@@ -2548,7 +2559,13 @@ def async_grpo_train(
     )
 
     print("⏳ Preparing policy generation for training...")
-    if NEED_REFIT and POLICY_GENERATION_STALE:
+    if DO_TIME_SHARING:
+        # In RLix mode, inference workers start sleeping and receive weights via
+        # selective sync on the first expand (triggered by before_training at step 0).
+        # Skip the initial full refit; generation routing is enabled by the scheduler.
+        print("🔄 [RLix] Skipping initial refit — weights synced via selective sync on first expand.")
+        POLICY_GENERATION_STALE = False
+    elif NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...")
         try:
             refit_policy_generation(policy, policy_generation, colocated_inference)
@@ -2847,6 +2864,10 @@ def async_grpo_train(
                     )
 
                 print("▶ Preparing for training...")
+                # In RLix mode: block until scheduler grants training GPU allocation.
+                # The scheduler asynchronously shrinks overlap inference workers,
+                # freeing VRAM before policy.prepare_for_training() occupies GPU.
+                rlix_hooks.before_training(step)
                 with timer.time("training_prep"):
                     policy.prepare_for_training()
                     POLICY_GENERATION_STALE = True
@@ -2861,7 +2882,21 @@ def async_grpo_train(
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
-                if NEED_REFIT:
+                if DO_TIME_SHARING:
+                    # In RLix mode: training GPU released here; scheduler asynchronously
+                    # expands overlap inference workers and triggers selective weight sync
+                    # via NemoRLModelUpdateService. Expand completion is guaranteed before
+                    # before_training(step+1) returns (enforced by blocking request_gpus).
+                    with timer.time("weight_sync"):
+                        rlix_hooks.after_training(step)
+                    if NEED_REFIT:
+                        # Increment local weight_version to match the version that
+                        # _expand_workers will set on the collector via set_weight_version.
+                        # The actual collector update is done by the pipeline actor during
+                        # expand, which completes before the next before_training call.
+                        weight_version += 1
+                        POLICY_GENERATION_STALE = False
+                elif NEED_REFIT:
                     # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
                     with timer.time("exposed_generation"):
@@ -2902,12 +2937,15 @@ def async_grpo_train(
                     # Pause trajectory collection during validation to reduce memory pressure
                     trajectory_collector.pause.remote()
 
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                    if not DO_TIME_SHARING and NEED_REFIT and POLICY_GENERATION_STALE:
+                        # Standalone only: full refit before validation.
+                        # In RLix mode, policy_generation already has current weights
+                        # from the last selective sync; no full refit needed.
                         refit_policy_generation(
                             policy, policy_generation, colocated_inference
                         )
                         POLICY_GENERATION_STALE = False
-                    else:
+                    elif not DO_TIME_SHARING:
                         policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(
                         policy_generation,
