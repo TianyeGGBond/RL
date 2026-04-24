@@ -2405,6 +2405,7 @@ def async_grpo_train(
     # F5/F9: Resolve hooks — use injected real implementation or no-op default.
     from nemo_rl.algorithms.rlix_hooks import NoOpRLixHooks, RLixHooksProtocol
     hooks: RLixHooksProtocol = rlix_hooks if rlix_hooks is not None else NoOpRLixHooks()
+    print(f"[F5] mode={'rlix' if DO_TIME_SHARING else 'standalone'}, hooks={type(hooks).__name__}")
 
     # Ensure we are running with a compatible async generation backend
     assert _should_use_async_rollouts(master_config), (
@@ -2548,6 +2549,7 @@ def async_grpo_train(
     # F6: Register collector handle with pipeline actor so _expand_workers can
     # call set_weight_version after each selective sync (before routing activation).
     hooks.on_trajectory_collector_created(trajectory_collector)
+    print(f"[F6] on_trajectory_collector_created fired, collector={type(trajectory_collector).__name__}")
 
     print("📦 Started continuous background trajectory collection")
 
@@ -2804,6 +2806,7 @@ def async_grpo_train(
                 # F5: Block until scheduler grants actor_train GPUs.
                 # In RLix mode: scheduler asynchronously shrinks overlap inference
                 # workers before returning.  In standalone mode: no-op.
+                print(f"[F5] before_training step={step}")
                 hooks.before_training(step)
                 with timer.time("logprob_inference_prep"):
                     policy.prepare_for_lp_inference()
@@ -2889,6 +2892,7 @@ def async_grpo_train(
                     with timer.time("weight_sync"):
                         # Notify scheduler: actor_train GPUs are free.
                         # Scheduler asynchronously triggers expand + weight sync.
+                        print(f"[F5] after_training step={step}")
                         hooks.after_training(step)
                         # Keep local weight_version in sync with what _expand_workers
                         # will set on the collector (pipeline actor increments by 1).
