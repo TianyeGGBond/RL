@@ -2405,7 +2405,6 @@ def async_grpo_train(
     # F5/F9: Resolve hooks — use injected real implementation or no-op default.
     from nemo_rl.algorithms.rlix_hooks import NoOpRLixHooks, RLixHooksProtocol
     hooks: RLixHooksProtocol = rlix_hooks if rlix_hooks is not None else NoOpRLixHooks()
-    print(f"[F5] mode={'rlix' if DO_TIME_SHARING else 'standalone'}, hooks={type(hooks).__name__}")
 
     # Ensure we are running with a compatible async generation backend
     assert _should_use_async_rollouts(master_config), (
@@ -2549,7 +2548,6 @@ def async_grpo_train(
     # F6: Register collector handle with pipeline actor so _expand_workers can
     # call set_weight_version after each selective sync (before routing activation).
     hooks.on_trajectory_collector_created(trajectory_collector)
-    print(f"[F6] on_trajectory_collector_created fired, collector={type(trajectory_collector).__name__}")
 
     print("📦 Started continuous background trajectory collection")
 
@@ -2560,6 +2558,7 @@ def async_grpo_train(
     print("⏳ Preparing policy generation for training...")
     # F5/F11: In RLix mode, skip initial refit and prepare_for_generation.
     # Weights are synced on first scheduler expand; sleep/wake is scheduler-driven.
+    # Calling prepare_for_generation here would reinitialize already-running inference workers.
     if not DO_TIME_SHARING:
         if NEED_REFIT and POLICY_GENERATION_STALE:
             print("🔄 Refitting policy generation with actual model weights...")
@@ -2806,7 +2805,6 @@ def async_grpo_train(
                 # F5: Block until scheduler grants actor_train GPUs.
                 # In RLix mode: scheduler asynchronously shrinks overlap inference
                 # workers before returning.  In standalone mode: no-op.
-                print(f"[F5] before_training step={step}")
                 hooks.before_training(step)
                 with timer.time("logprob_inference_prep"):
                     policy.prepare_for_lp_inference()
@@ -2892,11 +2890,14 @@ def async_grpo_train(
                     with timer.time("weight_sync"):
                         # Notify scheduler: actor_train GPUs are free.
                         # Scheduler asynchronously triggers expand + weight sync.
-                        print(f"[F5] after_training step={step}")
-                        hooks.after_training(step)
-                        # Keep local weight_version in sync with what _expand_workers
-                        # will set on the collector (pipeline actor increments by 1).
-                        weight_version += 1
+                        published_version = hooks.after_training(step)
+                        # RLix publishes version=cache_ready_step after active
+                        # refresh completes. Fall back to step for older hooks.
+                        weight_version = (
+                            int(published_version)
+                            if published_version is not None
+                            else int(step)
+                        )
                         POLICY_GENERATION_STALE = False
                 elif NEED_REFIT:
                     # Standalone mode — original refit path.
@@ -2940,13 +2941,14 @@ def async_grpo_train(
                     # Pause trajectory collection during validation to reduce memory pressure
                     trajectory_collector.pause.remote()
 
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            policy, policy_generation, colocated_inference
-                        )
-                        POLICY_GENERATION_STALE = False
-                    else:
-                        policy_generation.prepare_for_generation()
+                    if not DO_TIME_SHARING:
+                        if NEED_REFIT and POLICY_GENERATION_STALE:
+                            refit_policy_generation(
+                                policy, policy_generation, colocated_inference
+                            )
+                            POLICY_GENERATION_STALE = False
+                        else:
+                            policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(
                         policy_generation,
                         val_dataloader,

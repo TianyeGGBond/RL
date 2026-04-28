@@ -33,7 +33,7 @@ class RLixHooksProtocol(Protocol):
         """
         ...
 
-    def after_training(self, step: int) -> None:
+    def after_training(self, step: int) -> int | None:
         """Called after policy.train() completes; notifies scheduler to expand.
 
         F5: in RLix mode, notifies the scheduler that actor_train GPUs are
@@ -74,8 +74,8 @@ class NoOpRLixHooks:
     def before_training(self, step: int) -> None:
         pass
 
-    def after_training(self, step: int) -> None:
-        pass
+    def after_training(self, step: int) -> int | None:
+        return None
 
     def on_trajectory_collector_created(self, collector: Any) -> None:
         pass
