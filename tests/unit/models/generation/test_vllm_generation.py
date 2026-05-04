@@ -14,9 +14,10 @@
 
 import json
 import os
+import threading
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 import ray
@@ -33,7 +34,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.vllm_generation import ShardPreemptedError
+from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorker
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    VllmAsyncGenerationWorker,
     _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
@@ -187,6 +191,263 @@ def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refi
     )
 
     assert configured["vllm_cfg"]["load_format"] == "dummy"
+
+
+def _make_partial_overlap_policy(async_engine: bool = True, dp_size: int = 4):
+    policy = object.__new__(VllmGeneration)
+    policy.cfg = {"vllm_cfg": {"async_engine": async_engine}, "colocated": {"enabled": False}}
+    policy.worker_group = MagicMock()
+    policy.worker_group.dp_size = dp_size
+    policy.worker_group.get_dp_leader_worker_idx.side_effect = (
+        lambda dp_rank: dp_rank + 100
+    )
+    policy.current_generate_dp_shard_idx = 0
+    policy._active_dp_ranks = set(range(dp_size))
+    policy._active_dp_ranks_lock = threading.Lock()
+    policy._preempted_dp_ranks = set()
+    policy._preempted_dp_ranks_lock = threading.Lock()
+    return policy
+
+
+def _make_generation_input() -> BatchedDataDict[GenerationDatumSpec]:
+    return BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "input_lengths": torch.tensor([3], dtype=torch.int32),
+        }
+    )
+
+
+def _make_generation_output(original_idx: int = 0) -> BatchedDataDict:
+    return BatchedDataDict(
+        {
+            "output_ids": torch.tensor([[4, 5]], dtype=torch.long),
+            "logprobs": torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+            "generation_lengths": torch.tensor([2], dtype=torch.int32),
+            "unpadded_sequence_lengths": torch.tensor([2], dtype=torch.int32),
+        }
+    )
+
+
+def _make_successful_async_worker_proxy(original_idx: int = 0):
+    async def sample_result_ref():
+        return original_idx, _make_generation_output(original_idx)
+
+    async def worker_gen():
+        yield sample_result_ref()
+
+    return worker_gen()
+
+
+def _make_failing_async_worker_proxy(exc: Exception):
+    async def worker_gen():
+        if False:
+            yield None
+        raise exc
+
+    return worker_gen()
+
+
+async def _collect_async_generate_outputs(policy, data):
+    outputs = []
+    async for item in policy._async_generate_base(
+        data,
+        "generate_async",
+        lambda batched_data: bool(len(batched_data["input_ids"])),
+    ):
+        outputs.append(item)
+    return outputs
+
+
+def _extract_gen_leader_worker_indices(outputs: BatchedDataDict) -> set[int]:
+    worker_indices = outputs["gen_leader_worker_idx"]
+    if hasattr(worker_indices, "reshape"):
+        worker_indices = worker_indices.reshape(-1).tolist()
+    elif not isinstance(worker_indices, list):
+        worker_indices = [worker_indices]
+    return {int(idx) for idx in worker_indices}
+
+
+def test_vllm_generation_worker_sleep_passes_configured_level_and_mode():
+    worker = object.__new__(VllmGenerationWorker.__ray_metadata__.modified_class)
+    worker.cfg = {"vllm_cfg": {"async_engine": False, "sleep_level": 2}}
+    worker.llm = MagicMock()
+    worker.llm.renderer = MagicMock()
+
+    worker.sleep(mode="wait")
+
+    worker.llm.llm_engine.reset_prefix_cache.assert_called_once_with()
+    worker.llm.renderer.clear_mm_cache.assert_called_once_with()
+    worker.llm.sleep.assert_called_once_with(level=2, mode="wait")
+
+
+def test_vllm_generation_worker_sleep_explicit_level_overrides_config():
+    worker = object.__new__(VllmGenerationWorker.__ray_metadata__.modified_class)
+    worker.cfg = {"vllm_cfg": {"async_engine": False, "sleep_level": 2}}
+    worker.llm = MagicMock()
+    worker.llm.renderer = MagicMock()
+
+    worker.sleep(level=1, mode="wait")
+
+    worker.llm.sleep.assert_called_once_with(level=1, mode="wait")
+
+
+@pytest.mark.asyncio
+async def test_vllm_async_generation_worker_sleep_passes_configured_level_and_mode():
+    worker = object.__new__(VllmAsyncGenerationWorker.__ray_metadata__.modified_class)
+    worker.cfg = {"vllm_cfg": {"async_engine": True, "sleep_level": 2}}
+    worker.llm = MagicMock()
+    worker.llm.reset_prefix_cache = AsyncMock()
+    worker.llm.reset_mm_cache = AsyncMock()
+    worker.llm.sleep = AsyncMock()
+
+    await worker.sleep_async(mode="wait")
+
+    worker.llm.reset_prefix_cache.assert_awaited_once_with()
+    worker.llm.reset_mm_cache.assert_awaited_once_with()
+    worker.llm.sleep.assert_awaited_once_with(level=2, mode="wait")
+
+
+def test_vllm_generation_partial_overlap_helpers_update_active_ranks(monkeypatch):
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=4)
+    monkeypatch.setattr(ray, "get", lambda _future: True)
+
+    assert policy.sleep_partial([1, 3], level=2)
+    assert policy._active_dp_ranks == {0, 2}
+    assert policy.worker_group.run_single_worker_single_data.call_args_list == [
+        call(method_name="sleep_async", worker_idx=101, level=2, mode="wait"),
+        call(method_name="sleep_async", worker_idx=103, level=2, mode="wait"),
+    ]
+
+    policy.worker_group.run_single_worker_single_data.reset_mock()
+
+    assert policy.wake_up_partial([3], tags=["weights"])
+    assert policy._active_dp_ranks == {0, 2, 3}
+    policy.worker_group.run_single_worker_single_data.assert_called_once_with(
+        method_name="wake_up_async", worker_idx=103, tags=["weights"]
+    )
+
+
+def test_vllm_generation_selects_only_active_dp_ranks():
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=4)
+    policy._active_dp_ranks = {1, 3}
+
+    assert policy._select_next_active_dp_rank() == 1
+    assert policy._select_next_active_dp_rank() == 3
+    assert policy._select_next_active_dp_rank() == 1
+
+
+def test_vllm_generation_sleep_partial_restores_failed_shards(monkeypatch):
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=4)
+    policy.worker_group.run_single_worker_single_data.side_effect = ["sleep-1", "sleep-3"]
+
+    def fake_ray_get(future):
+        if future == "sleep-1":
+            return True
+        raise RuntimeError("sleep failed")
+
+    monkeypatch.setattr(ray, "get", fake_ray_get)
+
+    assert not policy.sleep_partial([1, 3], level=2)
+    assert policy._active_dp_ranks == {0, 2, 3}
+
+
+def test_vllm_generation_wait_mode_does_not_mark_preempted(monkeypatch):
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=4)
+    monkeypatch.setattr(ray, "get", lambda _future: True)
+
+    assert policy.sleep_partial([1], level=2, mode="wait")
+    assert policy._preempted_dp_ranks == set()
+
+
+def test_vllm_generation_abort_mode_marks_preempted(monkeypatch):
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=4)
+    monkeypatch.setattr(ray, "get", lambda _future: True)
+
+    assert policy.sleep_partial([1], level=2, mode="abort")
+    assert policy._preempted_dp_ranks == {1}
+
+
+def test_vllm_generation_rejects_sleeping_last_active_shard():
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=1)
+
+    assert not policy.sleep_partial([0], level=2, mode="wait")
+    assert policy._active_dp_ranks == {0}
+
+
+@pytest.mark.asyncio
+async def test_vllm_generation_retries_preempted_shard():
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=2)
+    data = _make_generation_input()
+    policy._preempted_dp_ranks = {0}
+    policy.worker_group.run_single_worker_single_data.side_effect = [
+        _make_failing_async_worker_proxy(RuntimeError("preempted")),
+        _make_successful_async_worker_proxy(),
+    ]
+
+    outputs = await _collect_async_generate_outputs(policy, data)
+
+    assert len(outputs) == 1
+    assert outputs[0][0] == 0
+    assert outputs[0][1]["gen_leader_worker_idx"] == [101]
+    assert policy.worker_group.run_single_worker_single_data.call_args_list == [
+        call(
+            method_name="generate_async",
+            worker_idx=100,
+            data=data,
+            greedy=False,
+        ),
+        call(
+            method_name="generate_async",
+            worker_idx=101,
+            data=data,
+            greedy=False,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_vllm_generation_raises_shard_preempted_after_retry_exhaustion():
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=2)
+    data = _make_generation_input()
+    policy._preempted_dp_ranks = {0, 1}
+    policy.worker_group.run_single_worker_single_data.side_effect = [
+        _make_failing_async_worker_proxy(RuntimeError("preempted-0")),
+        _make_failing_async_worker_proxy(RuntimeError("preempted-1")),
+    ]
+
+    with pytest.raises(ShardPreemptedError) as excinfo:
+        await _collect_async_generate_outputs(policy, data)
+
+    assert excinfo.value.dp_rank == 1
+
+
+@pytest.mark.asyncio
+async def test_vllm_generation_does_not_retry_non_preempt_error():
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=2)
+    data = _make_generation_input()
+    policy.worker_group.run_single_worker_single_data.return_value = (
+        _make_failing_async_worker_proxy(RuntimeError("boom"))
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await _collect_async_generate_outputs(policy, data)
+
+
+def test_vllm_generation_wake_partial_only_restores_successful_shards(monkeypatch):
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=4)
+    policy._active_dp_ranks = {0, 2}
+    policy.worker_group.run_single_worker_single_data.side_effect = ["wake-1", "wake-3"]
+
+    def fake_ray_get(future):
+        if future == "wake-1":
+            return True
+        raise RuntimeError("wake failed")
+
+    monkeypatch.setattr(ray, "get", fake_ray_get)
+
+    assert not policy.wake_up_partial([1, 3], tags=["weights"])
+    assert policy._active_dp_ranks == {0, 1, 2}
 
 
 def get_basic_megatron_test_config(
@@ -489,6 +750,97 @@ async def _generate_async(vllm_policy, tokenizer, test_input_data, greedy=False)
         pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
     )
     return outputs
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.asyncio
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Test requires at least 2 GPUs.")
+async def test_vllm_async_partial_sleep_wake_runtime_smoke(tokenizer, test_input_data):
+    generation_cluster_separate = get_generation_cluster_separate(2)
+    vllm_generation = None
+
+    try:
+        vllm_config = deepcopy(basic_vllm_test_config)
+        vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
+        vllm_config["vllm_cfg"]["async_engine"] = True
+        vllm_config["vllm_cfg"]["tensor_parallel_size"] = 1
+        vllm_config["colocated"]["enabled"] = False
+
+        vllm_generation = VllmGeneration(generation_cluster_separate, vllm_config)
+
+        leader_0 = vllm_generation.worker_group.get_dp_leader_worker_idx(0)
+        leader_1 = vllm_generation.worker_group.get_dp_leader_worker_idx(1)
+
+        outputs1 = await _generate_async(
+            vllm_generation, tokenizer, test_input_data, greedy=True
+        )
+        assert _extract_gen_leader_worker_indices(outputs1) == {leader_0, leader_1}
+
+        assert vllm_generation.sleep_partial([0], level=2, mode="wait")
+        assert vllm_generation._active_dp_ranks == {1}
+
+        outputs2 = await _generate_async(
+            vllm_generation, tokenizer, test_input_data, greedy=True
+        )
+        assert _extract_gen_leader_worker_indices(outputs2) == {leader_1}
+
+        assert vllm_generation.wake_up_partial([0])
+        assert vllm_generation._active_dp_ranks == {0, 1}
+
+        outputs3 = await _generate_async(
+            vllm_generation, tokenizer, test_input_data, greedy=True
+        )
+        assert _extract_gen_leader_worker_indices(outputs3) == {leader_0, leader_1}
+
+    finally:
+        if vllm_generation:
+            vllm_generation.shutdown()
+        try:
+            generation_cluster_separate.shutdown()
+        except Exception:
+            pass
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.asyncio
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Test requires at least 2 GPUs.")
+async def test_vllm_partial_sleep_rejects_last_active_shard_tp2(
+    tokenizer, test_input_data
+):
+    generation_cluster_separate = get_generation_cluster_separate(2)
+    vllm_generation = None
+
+    try:
+        vllm_config = deepcopy(basic_vllm_test_config)
+        vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
+        vllm_config["vllm_cfg"]["async_engine"] = True
+        vllm_config["vllm_cfg"]["tensor_parallel_size"] = 2
+        vllm_config["colocated"]["enabled"] = False
+
+        vllm_generation = VllmGeneration(generation_cluster_separate, vllm_config)
+
+        leader_0 = vllm_generation.worker_group.get_dp_leader_worker_idx(0)
+
+        outputs1 = await _generate_async(
+            vllm_generation, tokenizer, test_input_data, greedy=True
+        )
+        assert _extract_gen_leader_worker_indices(outputs1) == {leader_0}
+
+        assert not vllm_generation.sleep_partial([0], level=2, mode="wait")
+        assert vllm_generation._active_dp_ranks == {0}
+
+        outputs2 = await _generate_async(
+            vllm_generation, tokenizer, test_input_data, greedy=True
+        )
+        assert _extract_gen_leader_worker_indices(outputs2) == {leader_0}
+
+    finally:
+        if vllm_generation:
+            vllm_generation.shutdown()
+        try:
+            generation_cluster_separate.shutdown()
+        except Exception:
+            pass
 
 
 @pytest.mark.asyncio
@@ -2640,3 +2992,178 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
             megatron_policy.shutdown()
         if vllm_generation:
             vllm_generation.shutdown()
+
+
+@pytest.mark.timeout(600)
+def test_vllm_direct_zmq_weight_update_cpu_serialize(
+    cluster, tokenizer, test_input_data
+):
+    """Test direct ZMQ weight update using cpu_serialize transport.
+
+    This exercises the lm_policy.stream_weights_via_ipc_zmq() → vllm_backend
+    path with explicit model_update_transport="cpu_serialize", bypassing the
+    env-var reading in refit_policy_generation.
+    """
+    from nemo_rl.models.policy.lm_policy import Policy
+
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
+    dtensor_config = basic_dtensor_test_config
+
+    vllm_policy = None
+    lm_policy = None
+    try:
+        lm_policy = Policy(cluster, dtensor_config, tokenizer)
+        vllm_policy = VllmGeneration(cluster, vllm_config)
+
+        state_dict_info = lm_policy.prepare_refit_info()
+        vllm_policy.prepare_refit_info(state_dict_info)
+
+        print("Running Generation 1 (Initial)...")
+        vllm_policy.prepare_for_generation()
+        outputs1 = vllm_policy.generate(test_input_data, greedy=True)
+        input_lengths = test_input_data["input_lengths"]
+        logprob1 = outputs1["logprobs"][0, input_lengths[0]].item()
+
+        print("Adding noise to weights in HF policy...")
+        ray.get(
+            [
+                worker._add_noise_to_weights.remote()
+                for worker in lm_policy.worker_group.workers
+            ]
+        )
+
+        vllm_policy.finish_generation()
+        lm_policy.offload_before_refit()
+        vllm_policy.prepare_for_generation(tags=["weights"])
+
+        buffer_size_bytes = int(1.5 * (1024**3))
+        futures_train = lm_policy.stream_weights_via_ipc_zmq(
+            buffer_size_bytes=buffer_size_bytes,
+            model_update_transport="cpu_serialize",
+        )
+        futures_inference = vllm_policy.update_weights_via_ipc_zmq()
+        ray.get(futures_train)
+        results = ray.get(futures_inference)
+        assert all(
+            result for result in results if result is not None
+        ), "cpu_serialize weight update should succeed"
+
+        lm_policy.offload_after_refit()
+        vllm_policy.prepare_for_generation(tags=["kv_cache"])
+        print("Running Generation 2 (Weights Updated)...")
+        outputs2 = vllm_policy.generate(test_input_data, greedy=True)
+        logprob2 = outputs2["logprobs"][0, input_lengths[0]].item()
+        assert logprob2 != logprob1, (
+            "Logprobs should change after cpu_serialize direct weight update."
+        )
+
+    finally:
+        if vllm_policy:
+            vllm_policy.shutdown()
+        if lm_policy:
+            lm_policy.shutdown()
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.asyncio
+async def test_vllm_async_refit_cpu_serialize(
+    cluster, test_input_data, tokenizer, monkeypatch
+):
+    """Test async refit path using cpu_serialize transport via env var.
+
+    This exercises the refit_policy_generation() → env-var → sender →
+    receiver path with NRL_MODEL_UPDATE_TRANSPORT=cpu_serialize.
+    """
+    from nemo_rl.models.policy.lm_policy import Policy
+
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config = configure_generation_config(vllm_config, tokenizer)
+    vllm_config["vllm_cfg"]["async_engine"] = True
+    dtensor_config = basic_dtensor_test_config
+
+    lm_policy = None
+    updated_policy = None
+    async_policy = None
+    try:
+        async_policy = VllmGeneration(cluster, vllm_config)
+        async_policy.finish_generation()
+
+        lm_policy = Policy(cluster, dtensor_config, tokenizer)
+
+        state_dict_info = lm_policy.prepare_refit_info()
+        async_policy.prepare_refit_info(state_dict_info)
+
+        monkeypatch.setenv("NRL_MODEL_UPDATE_TRANSPORT", "cpu_serialize")
+
+        print("Running initial cpu_serialize refit...")
+        refit_policy_generation(
+            lm_policy,
+            async_policy,
+            vllm_config["colocated"]["enabled"],
+        )
+
+        print("Running Generation 1 (Initial)...")
+        outputs1 = await _generate_async(
+            async_policy, tokenizer, test_input_data, greedy=True
+        )
+        input_lengths = test_input_data["input_lengths"]
+        logprob1 = outputs1["logprobs"][0, input_lengths[0]].item()
+
+        async_policy.finish_generation()
+
+        lm_policy.shutdown()
+        lm_policy = None
+
+        updated_policy = Policy(cluster, dtensor_config, tokenizer)
+        state_dict_info = updated_policy.prepare_refit_info()
+        async_policy.prepare_refit_info(state_dict_info)
+
+        print("Adding noise to weights in HF policy...")
+        ray.get(
+            [
+                worker._add_noise_to_weights.remote()
+                for worker in updated_policy.worker_group.workers
+            ]
+        )
+
+        print("Running cpu_serialize refit after weight change...")
+        refit_policy_generation(
+            updated_policy,
+            async_policy,
+            vllm_config["colocated"]["enabled"],
+        )
+
+        print("Running Generation 2 (Weights Updated)...")
+        outputs2 = await _generate_async(
+            async_policy, tokenizer, test_input_data, greedy=True
+        )
+        logprob2 = outputs2["logprobs"][0, input_lengths[0]].item()
+        assert logprob2 != logprob1, (
+            "Logprobs should change after cpu_serialize async refit."
+        )
+
+    finally:
+        if async_policy:
+            try:
+                async_policy.shutdown()
+            except Exception:
+                pass
+        if lm_policy:
+            try:
+                lm_policy.shutdown()
+            except Exception:
+                pass
+        if updated_policy:
+            try:
+                updated_policy.shutdown()
+            except Exception:
+                pass
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
