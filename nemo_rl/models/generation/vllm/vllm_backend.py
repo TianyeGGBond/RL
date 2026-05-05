@@ -329,154 +329,281 @@ class VllmInternalWorkerExtension:
 
         return True
 
+    # ------------------------------------------------------------------
+    # rlix integration: selective sync receiver methods (Feature 4)
+    # ------------------------------------------------------------------
+
     def setup_collective_group(
         self,
         model_update_name: str,
-        comm_plan: dict[int, Any],
+        comm_plan: dict,
         mode: str,
         timeout_s: float | None = None,
-        dp_rank: int | None = None,
-    ) -> bool:
-        """Create a temporary RLix model-update NCCL group for this vLLM rank."""
-        del timeout_s  # StatelessProcessGroup does not expose timeout control.
+    ) -> None:
+        """Join a dynamic NCCL group for selective model weight broadcast.
+
+        Stores the group in ``self._model_update_groups[group_name]``.
+
+        Args:
+            model_update_name: Unique sync identifier.
+            comm_plan: Communication plan with master_addr/port/world_size.
+            mode: 'receiver' (inference workers are always receivers).
+            timeout_s: Optional NCCL init timeout in seconds (unused; StatelessProcessGroup uses its own timeout).
+        """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
-        if len(comm_plan) != 1:
-            raise ValueError(
-                "RLix model-update receiver expects a single owner comm plan; "
-                f"got {len(comm_plan)} entries"
-            )
-        owner_plan = next(iter(comm_plan.values()))
-        local_rank = int(torch.distributed.get_rank())
-        rank = None
-        if mode == "sender":
-            rank = 0
-        else:
-            if dp_rank is None:
-                raise ValueError("dp_rank is required for receiver setup")
-            local_ranks = owner_plan.get("broadcast_local_ranks_by_dp_rank", {}).get(
-                int(dp_rank), []
-            )
-            if local_rank not in [int(x) for x in local_ranks]:
-                return True
-            devices = owner_plan.get("tgt_devices", [])
-            ordered = [
-                (int(item["rank"]), int(item["device"]))
-                for item in devices
-            ]
-            try:
-                rank = 1 + ordered.index((int(dp_rank), local_rank))
-            except ValueError:
-                return True
+        if not hasattr(self, "_model_update_groups"):
+            self._model_update_groups: dict = {}  # pyrefly: ignore[implicitly-defined-attribute]
 
-        groups = getattr(self, "_rlix_model_update_groups", None)
-        if groups is None:
-            groups = {}
-            self._rlix_model_update_groups = groups
-        group = StatelessProcessGroup(
-            master_address=str(owner_plan["master_addr"]),
-            port=int(owner_plan["master_port"]),
-            rank=int(rank),
-            world_size=1 + len(owner_plan.get("tgt_devices", [])),
+        plan_entry = comm_plan[next(iter(comm_plan))]
+        group_name: str = plan_entry["group_name"]
+        master_addr: str = plan_entry["master_addr"]
+        master_port: int = int(plan_entry["master_port"])
+        tgt_devices: list = plan_entry.get("tgt_devices", [])
+        world_size = 1 + len(tgt_devices)
+
+        local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        rank = 1
+        for i, dev in enumerate(tgt_devices):
+            if int(dev.get("rank", -1)) == local_rank:
+                rank = i + 1
+                break
+
+        pg = StatelessProcessGroup(
+            master_address=master_addr,
+            port=master_port,
+            rank=rank,
+            world_size=world_size,
         )
-        group.init_nccl_communicator(device=self.device)
-        groups[str(model_update_name)] = group
-        return True
+        pg.init_nccl_communicator(device=self.device)
+        self._model_update_groups[group_name] = pg
 
     def update_parameter_in_bucket(
         self,
-        payload_list: list[Any],
+        payload: dict,
+        ipc_local_ranks: list[int],
+        model_update_transport: str,
         is_lora: bool = False,
-        ipc_local_ranks: list[int] | None = None,
-        model_update_transport: str | None = None,
-    ) -> bool:
-        """Apply one IPC-delivered RLix weight bucket to selected local ranks."""
-        del is_lora, model_update_transport
-        local_rank = int(torch.distributed.get_rank())
-        if ipc_local_ranks is not None and local_rank not in [int(x) for x in ipc_local_ranks]:
-            return True
-        weights: list[tuple[str, torch.Tensor]] = []
-        for item in payload_list:
-            if isinstance(item, tuple) and len(item) == 2:
-                weights.append(item)
-            elif isinstance(item, dict):
-                name = item.get("name") or item.get("key")
-                tensor = item.get("tensor")
-                if tensor is None:
-                    tensor = item.get("value")
-                if name is not None and tensor is not None:
-                    weights.append((str(name), tensor))
-        policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
+    ) -> None:
+        """Receive a packed weight bucket and load it into the model.
+
+        Two transport modes (spec: nemorl-port-plan.md lines 316-323, 344-345):
+
+        ``"cpu_serialize"`` — payload contains ``cpu_uint8_bucket`` (CPU uint8 tensor).
+            DMA copies the buffer to GPU, then unpacks per-param tensors.
+            Used for cross-GPU or containerized deployments where CUDA IPC is unavailable.
+
+        ``"cuda_ipc"`` — payload contains ``cuda_ipc_handle`` (CUDA IPC handle tuple).
+            Rebuilds the GPU tensor directly via ``rebuild_cuda_tensor_from_ipc()``
+            (zero-copy for same-physical-GPU colocated processes).
+            Required when sender and receiver share a physical GPU; NCCL cannot
+            form a group between two ranks on the same GPU (spec line 316).
+
+        Args:
+            payload: Transport dict. cpu_serialize: keys ``param_names``, ``shapes``,
+                ``dtypes``, ``offsets``, ``used_bytes``, ``cpu_uint8_bucket``.
+                cuda_ipc: same keys but ``cuda_ipc_handle`` instead of ``cpu_uint8_bucket``.
+            ipc_local_ranks: Infer-local ranks that should process this bucket.
+            model_update_transport: ``"cpu_serialize"`` or ``"cuda_ipc"``.
+            is_lora: Reserved for LoRA adapter weights (not yet used).
+        """
+        # Use the vLLM worker's own rank, not the distributed process-group rank.
+        # ipc_local_ranks contains LOCAL ranks within the worker (comm-plan contract,
+        # spec nemorl-port-plan.md:406-412); torch.distributed.get_rank() would be
+        # the wrong identity in multi-node setups. (Matches ROLL worker.py:757.)
+        local_rank = getattr(self, "rank", None)
+        if local_rank is None:
+            # Fallback for workers that don't expose .rank — use distributed rank.
+            local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if local_rank not in ipc_local_ranks:
+            return
+
+        from rlix.pipeline.bucket_cache import BucketRecord, unpack_bucket_record
+
+        # --- Reconstruct named tensors from transport payload ---
+        if model_update_transport == "cuda_ipc":
+            # Zero-copy: sender and receiver share the same physical GPU.
+            # Rebuild GPU tensor from IPC handle — no CPU roundtrip.
+            # Spec line 316: NCCL cannot form a group on the same GPU; IPC is required.
+            from torch.multiprocessing.reductions import rebuild_cuda_tensor
+            device_id = self.device.index if hasattr(self.device, "index") else 0
+            ipc_args = list(payload["cuda_ipc_handle"][0])
+            ipc_args[6] = device_id  # patch device index
+            buf_gpu = rebuild_cuda_tensor(*ipc_args)
+            torch.cuda.current_stream().synchronize()
+
+            # Reconstruct named tensors directly from GPU buffer (no CPU copy)
+            weights = []
+            for name, shape, dtype, offset in zip(
+                payload["param_names"], payload["shapes"],
+                payload["dtypes"], payload["offsets"]
+            ):
+                num_elements = 1
+                for s in shape:
+                    num_elements *= s
+                nbytes = num_elements * torch.empty(0, dtype=dtype).element_size()
+                flat = buf_gpu[offset : offset + nbytes].view(dtype)
+                weights.append((name, flat.reshape(shape)))
+        else:
+            # cpu_serialize: DMA copy pinned CPU buffer → GPU, then unpack
+            buf_gpu = payload["cpu_uint8_bucket"].pin_memory().to(self.device, non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+
+            record = BucketRecord(
+                param_names=payload["param_names"],
+                shapes=payload["shapes"],
+                dtypes=payload["dtypes"],
+                offsets=payload["offsets"],
+                used_bytes=payload["used_bytes"],
+                cpu_uint8_bucket=buf_gpu.cpu(),
+            )
+            named_tensors = unpack_bucket_record(record)
+            weights = [(name, t.to(self.device)) for name, t in named_tensors]
+
         from nemo_rl.models.generation.vllm.quantization import fp8
 
+        policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         if fp8.is_fp8_model(self.model_runner.vllm_config):
             fp8.load_weights(policy_weights, self.model_runner)
         else:
             self.model_runner.model.load_weights(weights=policy_weights)
         self._load_draft_weights(draft_weights)
         torch.cuda.current_stream().synchronize()
-        return True
+        del buf_gpu, weights, policy_weights, draft_weights
 
     def broadcast_parameter(
         self,
         group_name: str,
         names: list[str],
-        dtypes: list[Any],
-        shapes: list[Any],
+        dtypes: list,
+        shapes: list,
+        broadcast_local_ranks: list[int],
         is_lora: bool = False,
-        broadcast_local_ranks: list[int] | None = None,
-    ) -> bool:
-        """Receive one RLix broadcast bucket and apply it to selected local ranks."""
-        del is_lora
-        local_rank = int(torch.distributed.get_rank())
-        if broadcast_local_ranks is not None and local_rank not in [int(x) for x in broadcast_local_ranks]:
-            return True
-        groups = getattr(self, "_rlix_model_update_groups", {})
-        group = groups.get(str(group_name))
-        if group is None:
-            raise RuntimeError(f"RLix model update group {group_name!r} is not initialized")
-        state_dict_info = {
-            str(name): (torch.Size(shape), dtype)
-            for name, dtype, shape in zip(names, dtypes, shapes)
-        }
+    ) -> None:
+        """Receive a packed NCCL broadcast and load weights into the model.
 
-        def _load(weights: list[tuple[str, torch.Tensor]]) -> None:
-            self.update_parameter_in_bucket(weights)
+        Args:
+            group_name: NCCL group name created by ``setup_collective_group``.
+            names: HF param names in order (matches sender's bucket).
+            dtypes: Per-param dtypes.
+            shapes: Per-param shapes.
+            broadcast_local_ranks: Infer-local ranks that participate.
+                Ranks not in this list return immediately (guard).
+            is_lora: If True, payload contains LoRA adapter weights (reserved,
+                not yet used — base weights always use False).
+        """
+        if not hasattr(self, "_model_update_groups"):
+            return
+        if group_name not in self._model_update_groups:
+            return
 
-        packed_broadcast_consumer(
-            iterator=iter(state_dict_info.items()),
-            group=group,
-            src=0,
-            post_unpack_func=_load,
+        local_rank = (
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         )
-        return True
+        if local_rank not in broadcast_local_ranks:
+            return
 
-    def destroy_collective_group(self, group_name: str) -> bool:
-        """Destroy a temporary RLix model-update group if this rank joined it."""
-        groups = getattr(self, "_rlix_model_update_groups", None)
-        if not groups:
-            return True
-        groups.pop(str(group_name), None)
-        gc.collect()
-        torch.cuda.empty_cache()
-        return True
+        group = self._model_update_groups[group_name]
 
-    def verify_model(self, expected_stats: dict[str, Any]) -> bool:
-        """Receiver API placeholder for RLix checksum verification."""
-        del expected_stats
-        return True
+        # Calculate total buffer size (aligned, same as sender packing).
+        from nemo_rl.models.policy.utils import calculate_aligned_size
 
-    def finalize_weight_update(self) -> bool:
-        """Run vLLM post-load hooks once after all RLix buckets are applied."""
+        total_bytes = 0
+        for name, shape, dtype in zip(names, shapes, dtypes):
+            num_elements = 1
+            for s in shape:
+                num_elements *= s
+            nbytes = num_elements * torch.empty(0, dtype=dtype).element_size()
+            total_bytes = calculate_aligned_size(total_bytes + nbytes)
+
+        recv_buf = torch.zeros(total_bytes, dtype=torch.uint8, device=self.device)
+        group.broadcast(recv_buf, src=0)
+
+        weights = []
+        offset = 0
+        for name, shape, dtype in zip(names, shapes, dtypes):
+            num_elements = 1
+            for s in shape:
+                num_elements *= s
+            nbytes = num_elements * torch.empty(0, dtype=dtype).element_size()
+            flat = recv_buf[offset : offset + nbytes].view(dtype)
+            weights.append((name, flat.reshape(shape)))
+            offset = calculate_aligned_size(offset + nbytes)
+
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
+        if fp8.is_fp8_model(self.model_runner.vllm_config):
+            fp8.load_weights(policy_weights, self.model_runner)
+        else:
+            self.model_runner.model.load_weights(weights=policy_weights)
+        self._load_draft_weights(draft_weights)
+        torch.cuda.current_stream().synchronize()
+        del recv_buf, weights, policy_weights, draft_weights
+
+    def destroy_collective_group(self, group_name: str) -> None:
+        """Destroy a dynamic NCCL group.
+
+        No-op guard: IPC-only ranks never join the NCCL group, so
+        ``group_name`` may not be present.
+
+        Args:
+            group_name: Group name as used in ``setup_collective_group``.
+        """
+        import torch.distributed as dist
+
+        if not hasattr(self, "_model_update_groups"):
+            return
+        if group_name not in self._model_update_groups:
+            return
+        pg = self._model_update_groups.pop(group_name)
+        try:
+            dist.destroy_process_group(pg)
+        except Exception:
+            pass
+
+    def verify_model(self, expected_stats: dict) -> None:
+        """Verify model weights match expected statistics after sync.
+
+        Args:
+            expected_stats: Dict with keys ``sum``, ``max``, ``min`` computed
+                by the sender over all weight tensors.
+
+        Raises:
+            RuntimeError: If any statistic deviates from expected by > 1e-3.
+        """
+        state_dict = self.model_runner.model.state_dict()
+        vals = [t.float() for t in state_dict.values() if t.numel() > 0]
+        if not vals:
+            return
+        all_flat = torch.cat([v.flatten() for v in vals])
+        actual = {
+            "sum": float(all_flat.sum()),
+            "max": float(all_flat.max()),
+            "min": float(all_flat.min()),
+        }
+        tol = 1e-3
+        for key in ("sum", "max", "min"):
+            if key not in expected_stats:
+                continue
+            if abs(actual[key] - expected_stats[key]) > tol * (abs(expected_stats[key]) + 1.0):
+                raise RuntimeError(
+                    f"verify_model: {key} mismatch: "
+                    f"expected={expected_stats[key]:.6f} actual={actual[key]:.6f}"
+                )
+
+    def finalize_weight_update(self) -> None:
+        """Run post-loading weight processing (FP8 KV cache, etc.).
+
+        Must be called after all buckets have been loaded via
+        ``update_parameter_in_bucket`` or ``broadcast_parameter``.
+        """
         from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
         process_weights_after_loading(
             self.model_runner.model, self.model_config, self.device
         )
         self._maybe_process_fp8_kv_cache()
-        gc.collect()
-        torch.cuda.empty_cache()
-        return True
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""
