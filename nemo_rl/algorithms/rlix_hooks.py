@@ -45,7 +45,7 @@ class RLixHooksProtocol(Protocol):
         Preconditions (must be satisfied before calling in RLix mode):
             - CPU bucket cache built (TODO F4: policy.build_cpu_bucket_cache)
             - Training GPU VRAM offloaded (TODO F11: policy.offload_training_gpu)
-            - Megatron NCCL groups destroyed (TODO F11: destroy_nccl_groups)
+            - Megatron NCCL groups destroyed (F11: destroy_megatron_nccl_groups)
         """
         ...
 
@@ -59,6 +59,33 @@ class RLixHooksProtocol(Protocol):
 
         Called once, immediately after AsyncTrajectoryCollector is created and
         set_weight_version has been called with the initial value.
+        """
+        ...
+
+    def begin_progress_batch(self, step: int, count_intended: int) -> None:
+        """F9: Activate the progress stream for one training step.
+
+        Must be called once before any end_progress_batch calls for that step.
+        Passes step_target_trajectories to the scheduler so it can estimate
+        remaining demand.
+
+        Args:
+            step: Current training step (weight_version).
+            count_intended: Total trajectories grpo_train will consume this
+                step (num_prompts_per_step).  Must be > 0.
+        """
+        ...
+
+    def end_progress_batch(self, step: int, trajectories_collected: int) -> None:
+        """F9: Report trajectories collected for the current step.
+
+        Called by AsyncTrajectoryCollector after each successful buffer push.
+        Increments the local counter and fires a fire-and-forget ProgressReport
+        to the coordinator/scheduler at 2% granularity.
+
+        Args:
+            step: Target weight version the trajectories were collected for.
+            trajectories_collected: Number of trajectories in this push (>= 0).
         """
         ...
 
@@ -78,4 +105,10 @@ class NoOpRLixHooks:
         return None
 
     def on_trajectory_collector_created(self, collector: Any) -> None:
+        pass
+
+    def begin_progress_batch(self, step: int, count_intended: int) -> None:
+        pass
+
+    def end_progress_batch(self, step: int, trajectories_collected: int) -> None:
         pass

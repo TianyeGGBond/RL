@@ -2541,8 +2541,10 @@ def async_grpo_train(
         else None
     )
     _tc_namespace = _rlix_ray_namespace if _rlix_ray_namespace else None
+    nccl_state_snapshot: dict[str, Any] | None = None
 
     # Initialize trajectory collector with synchronized collection
+    # F9: Pass rlix_hooks so ATC can call end_progress_batch after each push.
     trajectory_collector = AsyncTrajectoryCollector.options(
         runtime_env=_tc_runtime_env,
         **({"name": _tc_name, "namespace": _tc_namespace} if _tc_name else {}),
@@ -2553,10 +2555,8 @@ def async_grpo_train(
         master_config=master_config,
         replay_buffer=replay_buffer,
         start_step=step,
+        rlix_hooks=hooks,
     )
-
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
 
     # Ensure collector knows initial weight version
     trajectory_collector.set_weight_version.remote(weight_version)
@@ -2564,6 +2564,14 @@ def async_grpo_train(
     # F6: Register collector handle with pipeline actor so _expand_workers can
     # call set_weight_version after each selective sync (before routing activation).
     hooks.on_trajectory_collector_created(trajectory_collector)
+
+    # F9: Progress begin/end state lives in the collector actor because that is
+    # where per-push reports are emitted. Open the first stream before
+    # collection starts.
+    ray.get(trajectory_collector.begin_progress_batch.remote(step, num_prompts_per_step))
+
+    # Start trajectory collection in background
+    collection_task = trajectory_collector.start_collection.remote(dataloader)
 
     print("📦 Started continuous background trajectory collection")
 
@@ -2822,6 +2830,13 @@ def async_grpo_train(
                 # In RLix mode: scheduler asynchronously shrinks overlap inference
                 # workers before returning.  In standalone mode: no-op.
                 hooks.before_training(step)
+                if DO_TIME_SHARING and nccl_state_snapshot:
+                    from nemo_rl.models.megatron.nccl_offload import (
+                        reload_megatron_nccl_groups,
+                    )
+
+                    reload_megatron_nccl_groups(nccl_state_snapshot)
+                    nccl_state_snapshot = None
                 with timer.time("logprob_inference_prep"):
                     policy.prepare_for_lp_inference()
 
@@ -2899,11 +2914,18 @@ def async_grpo_train(
                     # calls pipeline._expand_workers() which does the atomic
                     # wake + selective sync + version update + routing activation (F6).
                     #
-                    # TODO F4:  policy.build_cpu_bucket_cache(step)
-                    #           self._cache_ready_step = step
-                    # TODO F11: policy.offload_training_gpu()
-                    #           policy.destroy_nccl_groups()
                     with timer.time("weight_sync"):
+                        # F11: PR #4 owns the Megatron NCCL destroy/reload
+                        # implementation. This branch only invokes it after
+                        # NeMo has offloaded training-side state.
+                        policy.offload_after_refit()
+                        from nemo_rl.models.megatron.nccl_offload import (
+                            destroy_megatron_nccl_groups,
+                        )
+
+                        nccl_stats = destroy_megatron_nccl_groups()
+                        nccl_state_snapshot = nccl_stats.get("state_snapshot") or None
+
                         # Notify scheduler: actor_train GPUs are free.
                         # Scheduler asynchronously triggers expand + weight sync.
                         published_version = hooks.after_training(step)
@@ -2914,6 +2936,13 @@ def async_grpo_train(
                             if published_version is not None
                             else int(step)
                         )
+                        next_progress_step = step + 1
+                        if next_progress_step < master_config["grpo"]["max_num_steps"]:
+                            ray.get(
+                                trajectory_collector.begin_progress_batch.remote(
+                                    next_progress_step, num_prompts_per_step
+                                )
+                            )
                         POLICY_GENERATION_STALE = False
                 elif NEED_REFIT:
                     # Standalone mode — original refit path.
