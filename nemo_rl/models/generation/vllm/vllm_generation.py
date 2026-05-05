@@ -860,9 +860,22 @@ class VllmGeneration(GenerationInterface):
         return all_success
 
     def wake_up_partial(
-        self, dp_ranks: list[int], tags: list[str] | None = None
+        self,
+        dp_ranks: list[int],
+        tags: list[str] | None = None,
+        skip_activate: bool = False,
     ) -> bool:
-        """Wake a subset of previously slept DP shards and restore routing."""
+        """Wake a subset of previously slept DP shards.
+
+        Args:
+            dp_ranks: DP shards to wake.
+            tags: Optional tags forwarded to vLLM wake_up/wake_up_async.
+            skip_activate: When True, wake workers but do NOT add ranks to
+                _active_dp_ranks and do NOT clear _preempted_dp_ranks.
+                Used by NemoRLFullFinetunePipeline._expand_workers() so that
+                ranks stay off the routing table until weight sync completes
+                (activate_dp_ranks() finalises routing after sync).
+        """
         if self.cfg["colocated"]["enabled"]:
             raise RuntimeError(
                 "Partial shard wake-up is only supported for non-colocated inference."
@@ -909,12 +922,39 @@ class VllmGeneration(GenerationInterface):
             else:
                 all_success = False
 
-        if successful_dp_ranks:
+        if successful_dp_ranks and not skip_activate:
             with self._active_dp_ranks_lock:
                 self._active_dp_ranks.update(successful_dp_ranks)
             self._clear_preempted_dp_ranks(successful_dp_ranks)
 
         return all_success
+
+    def mark_dp_ranks_inactive(self, dp_ranks: list[int]) -> None:
+        """Block routing to dp_ranks without sleeping workers.
+
+        Idempotent for already-sleeping ranks (no-op on _active_dp_ranks when
+        ranks are not present). Called at the start of _expand_workers() to
+        ensure woken-but-not-yet-synced ranks are never dispatched to.
+
+        Args:
+            dp_ranks: DP ranks to block from routing.
+        """
+        with self._active_dp_ranks_lock:
+            self._active_dp_ranks.difference_update(dp_ranks)
+        self._mark_preempted_dp_ranks(dp_ranks)
+
+    def activate_dp_ranks(self, dp_ranks: list[int]) -> None:
+        """Make dp_ranks routable and clear their preemption status.
+
+        Called after weight sync completes in _expand_workers() to atomically
+        move ranks from pre-activation → routing table.
+
+        Args:
+            dp_ranks: DP ranks to make routable.
+        """
+        self._clear_preempted_dp_ranks(dp_ranks)
+        with self._active_dp_ranks_lock:
+            self._active_dp_ranks.update(dp_ranks)
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
